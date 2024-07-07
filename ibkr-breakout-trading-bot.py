@@ -3,15 +3,17 @@ import threading
 import csv
 import random
 import sqlite3
+import time
 import yfinance as yf
 import pandas as pd
+import argparse
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order
 
 class BreakoutTradingBot(EWrapper, EClient):
-    def __init__(self):
+    def __init__(self, is_armed=False):
         EClient.__init__(self, self)
         self.nextOrderId = None
         self.positions = {}
@@ -22,6 +24,8 @@ class BreakoutTradingBot(EWrapper, EClient):
         self.max_investment = 200
         self.db_connection = sqlite3.connect('trades.db')
         self.create_trades_table()
+        self.is_armed = is_armed
+        self.stop_event = threading.Event()
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -41,6 +45,7 @@ class BreakoutTradingBot(EWrapper, EClient):
         print("IBKR API started")
 
     def stop(self):
+        self.stop_event.set()
         self.disconnect()
         self.db_connection.close()
         print("IBKR API stopped and database connection closed")
@@ -51,24 +56,21 @@ class BreakoutTradingBot(EWrapper, EClient):
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT,
-                entry_time TIMESTAMP,
-                entry_price REAL,
+                order_type TEXT,
+                order_time TIMESTAMP,
+                price REAL,
                 quantity INTEGER,
-                exit_time TIMESTAMP,
-                exit_price REAL,
-                exit_reason TEXT,
-                profit_loss REAL
+                reason TEXT
             )
         ''')
         self.db_connection.commit()
 
-    def log_trade(self, symbol, entry_time, entry_price, quantity, exit_time, exit_price, exit_reason):
-        profit_loss = (exit_price - entry_price) * quantity
+    def log_order(self, symbol, order_type, price, quantity, reason):
         cursor = self.db_connection.cursor()
         cursor.execute('''
-            INSERT INTO trades (symbol, entry_time, entry_price, quantity, exit_time, exit_price, exit_reason, profit_loss)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (symbol, entry_time, entry_price, quantity, exit_time, exit_price, exit_reason, profit_loss))
+            INSERT INTO trades (symbol, order_type, order_time, price, quantity, reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (symbol, order_type, datetime.datetime.now(), price, quantity, reason))
         self.db_connection.commit()
 
     def load_symbols(self, filename='stocks.csv'):
@@ -90,6 +92,20 @@ class BreakoutTradingBot(EWrapper, EClient):
                 print(f"No historical data available for {symbol}")
         except Exception as e:
             print(f"Error downloading data for {symbol}: {e}")
+
+    def fetch_real_time_data(self, symbol):
+        try:
+            end_date = datetime.datetime.now()
+            start_date = end_date - datetime.timedelta(minutes=5)
+            data = yf.download(symbol, start=start_date, end=end_date, interval="1m")
+            if not data.empty:
+                return data.iloc[-1]
+            else:
+                print(f"No real-time data available for {symbol}")
+                return None
+        except Exception as e:
+            print(f"Error fetching real-time data for {symbol}: {e}")
+            return None
 
     def calculate_average_candle_size(self, symbol):
         if symbol in self.historical_data:
@@ -135,18 +151,12 @@ class BreakoutTradingBot(EWrapper, EClient):
         self.placeOrder(self.nextOrderId, contract, order)
         self.nextOrderId += 1
 
-        # Log the trade if it's a sell order
-        if action == "SELL" and symbol in self.positions:
-            position = self.positions[symbol]
-            self.log_trade(
-                symbol,
-                position['entry_time'],
-                position['entry'],
-                quantity,
-                datetime.datetime.now(),
-                price if price else self.current_day_data[symbol].iloc[-1]['Close'],
-                position['exit_reason']
-            )
+        # Log the order
+        if action == "BUY":
+            self.log_order(symbol, "BUY", price if price else self.current_day_data[symbol].iloc[-1]['Close'], quantity, "Breakout found")
+        elif action == "SELL":
+            reason = self.positions[symbol]['exit_reason'] if symbol in self.positions else "Unknown"
+            self.log_order(symbol, "SELL", price if price else self.current_day_data[symbol].iloc[-1]['Close'], quantity, reason)
 
     def manage_trade(self, symbol):
         if symbol not in self.positions:
@@ -222,6 +232,12 @@ class BreakoutTradingBot(EWrapper, EClient):
         for symbol in self.symbols:
             self.request_historical_data(symbol)
         
+        if self.is_armed:
+            self.run_live_strategy()
+        else:
+            self.run_simulation()
+
+    def run_simulation(self):
         simulation_periods = 100  # Simulate 100 new candles for each symbol
         
         for _ in range(simulation_periods):
@@ -241,8 +257,27 @@ class BreakoutTradingBot(EWrapper, EClient):
             
             print(f"Completed simulation period {_ + 1}/{simulation_periods}")
 
+    def run_live_strategy(self):
+        while not self.stop_event.is_set():
+            for symbol in self.symbols:
+                new_candle = self.fetch_real_time_data(symbol)
+                if new_candle is not None:
+                    self.on_new_candle(symbol, new_candle)
+                    print(f"Processed new real-time candle for {symbol} at {new_candle.name}")
+            
+            # Wait for 5 minutes before the next update
+            for _ in range(300):  # 300 seconds = 5 minutes
+                if self.stop_event.is_set():
+                    break
+                time.sleep(1)
+
 if __name__ == "__main__":
-    bot = BreakoutTradingBot()
+    parser = argparse.ArgumentParser(description='IBKR Breakout Trading Bot')
+    parser.add_argument('--arm', action='store_true', help='Arm the trading bot (default: False)')
+    args = parser.parse_args()
+
+    bot = BreakoutTradingBot(is_armed=args.arm)
+    print(f"Bot armed: {bot.is_armed}")
     bot.start()
     bot.run_strategy()
     input("Press Enter to stop...")
